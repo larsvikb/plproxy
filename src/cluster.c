@@ -60,14 +60,13 @@ static const char part_sql[] = "select * from plproxy.get_cluster_partitions($1)
 /* query for fetching cluster config */
 static const char config_sql[] = "select * from plproxy.get_cluster_config($1)";
 
-#ifdef PLPROXY_USE_SQLMED
-
 /* list of all the valid configuration options to plproxy cluster */
 static const char *cluster_config_options[] = {
 	"statement_timeout",
 	"connection_lifetime",
 	"query_timeout",
 	"disable_binary",
+	/* deprecated */
 	"keepalive_idle",
 	"keepalive_interval",
 	"keepalive_count",
@@ -76,8 +75,6 @@ static const char *cluster_config_options[] = {
 
 extern Datum plproxy_fdw_validator(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(plproxy_fdw_validator);
-
-#endif
 
 /*
  * Connection count should be non-zero and power of 2.
@@ -164,9 +161,7 @@ plproxy_cluster_cache_init(void)
 
 	cluster_mem = AllocSetContextCreate(TopMemoryContext,
 										"PL/Proxy cluster context",
-										ALLOCSET_SMALL_MINSIZE,
-										ALLOCSET_SMALL_INITSIZE,
-										ALLOCSET_SMALL_MAXSIZE);
+										ALLOCSET_SMALL_SIZES);
 	aatree_init(&cluster_tree, cluster_name_cmp, NULL);
 	aatree_init(&fake_cluster_tree, cluster_name_cmp, NULL);
 }
@@ -299,6 +294,7 @@ clear_config(ProxyConfig *cf)
 static void
 set_config_key(ProxyFunction *func, ProxyConfig *cf, const char *key, const char *val)
 {
+	static int did_warn = 0;
 	if (pg_strcasecmp(key, "statement_timeout") == 0)
 		/* ignore */ ;
 	else if (pg_strcasecmp("connection_lifetime", key) == 0)
@@ -307,12 +303,15 @@ set_config_key(ProxyFunction *func, ProxyConfig *cf, const char *key, const char
 		cf->query_timeout = atoi(val);
 	else if (pg_strcasecmp("disable_binary", key) == 0)
 		cf->disable_binary = atoi(val);
-	else if (pg_strcasecmp("keepalive_idle", key) == 0)
-		cf->keepidle = atoi(val);
-	else if (pg_strcasecmp("keepalive_interval", key) == 0)
-		cf->keepintvl = atoi(val);
-	else if (pg_strcasecmp("keepalive_count", key) == 0)
-		cf->keepcnt = atoi(val);
+	else if (pg_strcasecmp("keepalive_idle", key) == 0
+		|| pg_strcasecmp("keepalive_interval", key) == 0
+		|| pg_strcasecmp("keepalive_count", key) == 0)
+	{
+		if (atoi(val) > 0 && !did_warn) {
+			did_warn = 1;
+			elog(WARNING, "Use libpq keepalive options, PL/Proxy keepalive options not supported");
+		}
+	}
 	else if (pg_strcasecmp("default_user", key) == 0)
 		snprintf(cf->default_user, sizeof(cf->default_user), "%s", val);
 	else
@@ -426,8 +425,6 @@ reload_parts(ProxyCluster *cluster, Datum dname, ProxyFunction *func)
 
 	return 0;
 }
-
-#ifdef PLPROXY_USE_SQLMED
 
 /* extract a partition number from foreign server option */
 static bool
@@ -560,16 +557,17 @@ reload_sqlmed_user(ProxyFunction *func, ProxyCluster *cluster)
 	ListCell		   *cell;
 	AclResult			aclresult;
 	bool				got_user;
+	Oid				umid;
 
 
 	um = GetUserMapping(userinfo->user_oid, cluster->sqlmed_server_oid);
 
 	/* retry same lookup so we can set cache stamp... */
-    tup = SearchSysCache(USERMAPPINGUSERSERVER,
+	tup = SearchSysCache(USERMAPPINGUSERSERVER,
 						 ObjectIdGetDatum(um->userid),
 						 ObjectIdGetDatum(um->serverid),
 						 0, 0);
-    if (!HeapTupleIsValid(tup))
+	if (!HeapTupleIsValid(tup))
 	{
 		/* Specific mapping not found, try PUBLIC */
 		tup = SearchSysCache(USERMAPPINGUSERSERVER,
@@ -580,7 +578,13 @@ reload_sqlmed_user(ProxyFunction *func, ProxyCluster *cluster)
 			elog(ERROR, "cache lookup failed for user mapping (%u,%u)",
 				um->userid, um->serverid);
 	}
-	scstamp_set(USERMAPPINGOID, &userinfo->umStamp, tup);
+
+#if PG_VERSION_NUM >= 90600
+	umid = um->umid;
+#else
+	umid = HeapTupleGetOid(tup);
+#endif
+	scstamp_set(USERMAPPINGOID, &userinfo->umStamp, umid);
 	ReleaseSysCache(tup);
 
 	/*
@@ -642,14 +646,14 @@ reload_sqlmed_cluster(ProxyFunction *func, ProxyCluster *cluster,
 	/*
 	 * Look up the server and user mapping TIDs for handling syscache invalidations.
 	 */
-    tup = SearchSysCache(FOREIGNSERVEROID,
+	tup = SearchSysCache(FOREIGNSERVEROID,
 						 ObjectIdGetDatum(foreign_server->serverid),
 						 0, 0, 0);
 
-    if (!HeapTupleIsValid(tup))
-        elog(ERROR, "cache lookup failed for foreign server %u", foreign_server->serverid);
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for foreign server %u", foreign_server->serverid);
 
-	scstamp_set(FOREIGNSERVEROID, &cluster->clusterStamp, tup);
+	scstamp_set(FOREIGNSERVEROID, &cluster->clusterStamp, foreign_server->serverid);
 	ReleaseSysCache(tup);
 
 	/*
@@ -730,7 +734,7 @@ determine_compat_mode(ProxyCluster *cluster)
 	tup = SearchSysCache(NAMESPACENAME, PointerGetDatum("plproxy"), 0, 0, 0);
 	if (HeapTupleIsValid(tup))
 	{
-		Oid 		namespaceId = HeapTupleGetOid(tup);
+		Oid 		namespaceId = XNamespaceTupleGetOid(tup);
 		Oid			paramOids[] = { TEXTOID };
 		oidvector	*parameterTypes = buildoidvector(paramOids, 1);
 		const char	**funcname;
@@ -838,13 +842,6 @@ plproxy_syscache_callback_init(void)
 	CacheRegisterSyscacheCallback(USERMAPPINGOID, ClusterSyscacheCallback, (Datum) 0);
 }
 
-#else /* !PLPROXY_USE_SQLMED */
-
-void plproxy_syscache_callback_init(void) {}
-
-#endif
-
-
 
 /*
  * Reload the cluster configuration and partitions from plproxy.get_cluster*
@@ -893,7 +890,6 @@ new_cluster(const char *name)
 /*
  * Invalidate all connections for particular user
  */
-#ifdef PLPROXY_USE_SQLMED
 
 static void inval_userinfo_state(struct AANode *node, void *arg)
 {
@@ -923,8 +919,6 @@ static void inval_user_connections(ProxyCluster *cluster, ConnUserInfo *userinfo
 	 */
 	userinfo->needs_reload = false;
 }
-
-#endif
 
 /*
  * Initialize user info struct
@@ -962,23 +956,6 @@ get_userinfo(ProxyCluster *cluster, Oid user_oid)
 
 	return userinfo;
 }
-
-#if PG_VERSION_NUM < 90100
-
-static Oid
-get_role_oid(const char *rolname, bool missing_ok)
-{
-	Oid         oid;
-
-	oid = GetSysCacheOid(AUTHNAME, CStringGetDatum(rolname), 0, 0, 0);
-	if (!OidIsValid(oid) && !missing_ok)
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("role \"%s\" does not exist", rolname)));
-	return oid;
-}
-
-#endif
 
 /*
  * Refresh the cluster.
@@ -1018,7 +995,6 @@ refresh_cluster(ProxyFunction *func, ProxyCluster *cluster)
 	cluster->cur_userinfo = uinfo;
 
 	/* SQL/MED server reload */
-#ifdef PLPROXY_USE_SQLMED
 	if (cluster->needs_reload)
 	{
 		ForeignServer *server;
@@ -1040,19 +1016,15 @@ refresh_cluster(ProxyFunction *func, ProxyCluster *cluster)
 		}
 	}
 
-#endif
-
 	/* SQL/MED user reload */
 	if (uinfo->needs_reload)
 	{
-#ifdef PLPROXY_USE_SQLMED
 		if (cluster->sqlmed_cluster)
 		{
 			inval_user_connections(cluster, uinfo);
 			reload_sqlmed_user(func, cluster);
 		}
 		else
-#endif
 			uinfo->needs_reload = false;
 	}
 

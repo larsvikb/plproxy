@@ -31,18 +31,12 @@
 #include <fmgr.h>
 #include <executor/spi.h>
 
-#if PG_VERSION_NUM >= 80400
-#define PLPROXY_USE_SQLMED
 #include <foreign/foreign.h>
 #include <catalog/pg_foreign_data_wrapper.h>
 #include <catalog/pg_foreign_server.h>
 #include <catalog/pg_user_mapping.h>
-#endif
 
-#if PG_VERSION_NUM >= 90300
 #include <access/htup_details.h>
-#endif
-
 #include <access/reloptions.h>
 #include <access/tupdesc.h>
 #include <catalog/pg_namespace.h>
@@ -65,9 +59,8 @@
 #include "aatree.h"
 #include "rowstamp.h"
 
-
-#ifndef PG_MODULE_MAGIC
-#error PL/Proxy requires 8.2+
+#if PG_VERSION_NUM < 90300
+#error PL/Proxy requires 9.3+
 #endif
 
 /* give offset of a field inside struct */
@@ -144,6 +137,14 @@
 #endif
 
 /*
+ * backwards compatibility with v10.
+ */
+
+#if PG_VERSION_NUM >= 110000
+#define ACL_KIND_FOREIGN_SERVER OBJECT_FOREIGN_SERVER
+#endif
+
+/*
  * Determine if this argument is to SPLIT
  */
 #define IS_SPLIT_ARG(func, arg)	((func)->split_args && (func)->split_args[arg])
@@ -188,10 +189,6 @@ typedef struct ProxyConfig
 	int			query_timeout;			/* How long query may take (secs) */
 	int			connection_lifetime;	/* How long the connection may live (secs) */
 	int			disable_binary;			/* Avoid binary I/O */
-	/* keepalive parameters */
-	int			keepidle;
-	int			keepintvl;
-	int			keepcnt;
 	char		default_user[NAMEDATALEN];
 } ProxyConfig;
 
